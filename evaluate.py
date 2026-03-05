@@ -93,6 +93,30 @@ def train_dqn(timesteps: int = 50_000) -> DQN:
     print("DQN training complete — model saved to dqn_merge.zip")
     return model
 
+def evaluate_dqn_runs(n_runs=5, timesteps=100_000, n_episodes=200):
+    """Train DQN multiple times and average results to account for variance."""
+    all_results = []
+    
+    for run in range(n_runs):
+        print(f"\nDQN Run {run+1}/{n_runs}...")
+        train_dqn(timesteps=timesteps)
+        results = run_episodes_dqn(n_episodes=n_episodes)
+        save_results(results, f"dqn_run_{run+1}.csv")
+        
+        crashed = sum(r["crashed"] for r in results)
+        print(f"Run {run+1} crash rate: {crashed}/{n_episodes} = {crashed/n_episodes:.1%}")
+        all_results.append(results)
+    
+    # aggregate across runs
+    crash_rates = [sum(r["crashed"] for r in run)/n_episodes for run in all_results]
+    avg_speeds  = [np.mean([r["avg_speed"] for r in run]) for run in all_results]
+    
+    print(f"\n=== DQN Across {n_runs} Runs ===")
+    print(f"Crash rate: {np.mean(crash_rates):.1%} ± {np.std(crash_rates):.1%}")
+    print(f"Avg speed:  {np.mean(avg_speeds):.1f} ± {np.std(avg_speeds):.1f} m/s")
+    
+    return all_results
+
 def run_episodes_dqn(n_episodes: int = 200, render: bool = False) -> list[dict]:
     env   = gym.make("merge-v0", render_mode="human" if render else None)
     model = DQN.load("dqn_merge")
@@ -135,7 +159,8 @@ def print_summary(results: list[dict], label: str) -> None:
     print(f"  Opt 2b | >{K} consec steps < {V_TARGET} : {o2b}/{n} = {o2b/n:.1%}")
 
 def print_comparison(idm: list[dict], dqn: list[dict]) -> None:
-    n = len(idm)
+    n_idm = len(idm)
+    n_dqn = len(dqn)
     idm_crash = sum(r["crashed"] for r in idm)
     dqn_crash = sum(r["crashed"] for r in dqn)
     idm_avg   = np.mean([r["avg_speed"] for r in idm])
@@ -144,7 +169,9 @@ def print_comparison(idm: list[dict], dqn: list[dict]) -> None:
     print(f"\n{'='*45}")
     print("  Comparison (DQN vs IDM)")
     print(f"{'='*45}")
-    print(f"  Crash rate delta    : {(dqn_crash - idm_crash)/n:+.1%}")
+    print(f"  IDM crash rate      : {idm_crash}/{n_idm} = {idm_crash/n_idm:.1%}")
+    print(f"  DQN crash rate      : {dqn_crash}/{n_dqn} = {dqn_crash/n_dqn:.1%}")
+    print(f"  Crash rate delta    : {(dqn_crash/n_dqn) - (idm_crash/n_idm):+.1%}")
     print(f"  Avg speed delta     : {dqn_avg - idm_avg:+.1f} m/s")
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -157,14 +184,10 @@ if __name__ == "__main__":
     print_summary(idm_results, "IDM+MOBIL")
     save_results(idm_results, "idm_baseline.csv")
 
-    # DQN baseline
-    print("\nTraining DQN...")
-    train_dqn(timesteps=50_000)
+    # DQN with multiple runs
+    print("\nStarting DQN multi-run evaluation...")
+    dqn_all_runs = evaluate_dqn_runs(n_runs=5, timesteps=100_000, n_episodes=N)
 
-    print("\nRunning DQN episodes...")
-    dqn_results = run_episodes_dqn(n_episodes=N)
-    print_summary(dqn_results, "DQN")
-    save_results(dqn_results, "dqn_baseline.csv")
-
-    # Side-by-side comparison
-    print_comparison(idm_results, dqn_results)
+    # compare IDM against average DQN run
+    dqn_flat = [r for run in dqn_all_runs for r in run]
+    print_comparison(idm_results, dqn_flat)
