@@ -1,4 +1,6 @@
 import os
+from dataclasses import dataclass
+from itertools import product
 import gymnasium as gym
 import highway_env
 from highway_env.vehicle.behavior import IDMVehicle
@@ -12,6 +14,61 @@ K        = 5    # consecutive steps below V_TARGET to count as speed failure
 
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# ── Disturbance space ─────────────────────────────────────────────────────────
+# When adding CEM/IS, consider moving this block to disturbances.py
+
+GRID_SPEEDS    = [10.0, 15.0, 20.0, 25.0]   # merging vehicle initial speed (m/s)
+GRID_POSITIONS = [70.0, 90.0, 110.0, 130.0]  # position along j-k ramp lane (m)
+GRID_TRIALS    = 20                           # episodes per (speed, position) cell
+
+@dataclass
+class Disturbance:
+    merging_speed: float    = 20.0   # initial speed of merging vehicle (m/s)
+    merging_position: float = 110.0  # position along j-k ramp lane (m)
+    n_merging: int          = 1      # number of merging vehicles on ramp
+
+def apply_disturbance(env, d: Disturbance) -> None:
+    """
+    Patch merging vehicle state after env.reset().
+
+    The merge-v0 environment hard-codes one merging vehicle at position=110,
+    speed=20. This function repositions and re-speeds it (and optionally spawns
+    additional ones) without touching the environment's internals permanently.
+    """
+    road    = env.unwrapped.road
+    ego     = env.unwrapped.vehicle
+    jk_lane = road.network.get_lane(("j", "k", 0))
+
+    ramp_ids = {("j", "k", 0), ("k", "b", 0), ("b", "c", 2)}
+    merging_vs = [
+        v for v in road.vehicles
+        if tuple(v.lane_index) in ramp_ids and v is not ego
+    ]
+
+    if not merging_vs:
+        return
+
+    # --- primary merging vehicle ---
+    mv         = merging_vs[0]
+    mv.speed   = d.merging_speed
+    mv.position = jk_lane.position(d.merging_position, 0).copy()
+    mv.heading  = jk_lane.heading_at(d.merging_position)
+
+    # --- additional merging vehicles (20 m spacing behind) ---
+    VehicleClass = type(mv)
+    for i in range(1, d.n_merging):
+        pos = d.merging_position - i * 20.0
+        if pos < 0:
+            break
+        extra = VehicleClass(
+            road,
+            jk_lane.position(pos, 0),
+            heading=jk_lane.heading_at(pos),
+            speed=d.merging_speed,
+        )
+        extra.target_speed = 30.0
+        road.vehicles.append(extra)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def save_results(results: list[dict], filename: str) -> None:
@@ -52,18 +109,21 @@ def _speed_stats(speeds: list[float], crashed: bool) -> dict:
     }
 
 # ── IDM agent ────────────────────────────────────────────────────────────────
-def run_episodes(n_episodes: int = 200, render: bool = False) -> list[dict]:
+def run_episodes(
+    n_episodes: int = 200,
+    render: bool = False,
+    disturbance: Disturbance | None = None,
+) -> list[dict]:
     env = gym.make("merge-v0", render_mode="human" if render else None)
 
     results = []
     for episode in range(n_episodes):
-        obs, info    = env.reset()
-        terminated   = truncated = False
+        obs, info  = env.reset()
+        terminated = truncated = False
         speeds: list[float] = []
 
         # replace controlled ego with a fully autonomous IDM+MOBIL vehicle
-        ego = env.unwrapped.vehicle  # type: ignore
-        old_ego = ego
+        old_ego = env.unwrapped.vehicle  # type: ignore
         ego = IDMVehicle(
             env.unwrapped.road,          # type: ignore
             old_ego.position,
@@ -73,12 +133,19 @@ def run_episodes(n_episodes: int = 200, render: bool = False) -> list[dict]:
         env.unwrapped.road.vehicles[0] = ego  # type: ignore
         env.unwrapped.vehicle          = ego  # type: ignore
 
+        if disturbance is not None:
+            apply_disturbance(env, disturbance)
+
         while not (terminated or truncated):
             action = ego.act()
             obs, reward, terminated, truncated, info = env.step(action)
             speeds.append(float(ego.speed))
 
-        results.append({"episode": episode, **_speed_stats(speeds, bool(ego.crashed))})
+        row = {"episode": episode, **_speed_stats(speeds, bool(ego.crashed))}
+        if disturbance is not None:
+            row["merging_speed"]    = disturbance.merging_speed
+            row["merging_position"] = disturbance.merging_position
+        results.append(row)
 
     env.close()
     return results
@@ -117,7 +184,11 @@ def evaluate_dqn_runs(n_runs=5, timesteps=100_000, n_episodes=200):
     
     return all_results
 
-def run_episodes_dqn(n_episodes: int = 200, render: bool = False) -> list[dict]:
+def run_episodes_dqn(
+    n_episodes: int = 200,
+    render: bool = False,
+    disturbance: Disturbance | None = None,
+) -> list[dict]:
     env   = gym.make("merge-v0", render_mode="human" if render else None)
     model = DQN.load("dqn_merge")
 
@@ -127,16 +198,52 @@ def run_episodes_dqn(n_episodes: int = 200, render: bool = False) -> list[dict]:
         terminated = truncated = False
         speeds: list[float] = []
 
+        if disturbance is not None:
+            apply_disturbance(env, disturbance)
+
         while not (terminated or truncated):
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
             speeds.append(float(env.unwrapped.vehicle.speed))  # type: ignore
 
         crashed = bool(env.unwrapped.vehicle.crashed)  # type: ignore
-        results.append({"episode": episode, **_speed_stats(speeds, crashed)})
+        row = {"episode": episode, **_speed_stats(speeds, crashed)}
+        if disturbance is not None:
+            row["merging_speed"]    = disturbance.merging_speed
+            row["merging_position"] = disturbance.merging_position
+        results.append(row)
 
     env.close()
     return results
+
+# ── Grid sweep ───────────────────────────────────────────────────────────────
+def run_grid_sweep(
+    agent: str = "idm",
+    speeds: list[float] = GRID_SPEEDS,
+    positions: list[float] = GRID_POSITIONS,
+    n_trials: int = GRID_TRIALS,
+) -> list[dict]:
+    """
+    Run a full disturbance grid sweep for one agent.
+
+    For each (merging_speed, merging_position) cell, runs n_trials episodes and
+    records per-episode outcomes.  Results include disturbance params so the
+    DataFrame can be pivoted into a heatmap.
+
+    agent: "idm" or "dqn"
+    """
+    assert agent in ("idm", "dqn"), "agent must be 'idm' or 'dqn'"
+    runner = run_episodes if agent == "idm" else run_episodes_dqn
+
+    all_results = []
+    cells = list(product(speeds, positions))
+    for i, (spd, pos) in enumerate(cells):
+        d = Disturbance(merging_speed=spd, merging_position=pos)
+        print(f"  [{i+1}/{len(cells)}] speed={spd:.0f} m/s  position={pos:.0f} m ...", flush=True)
+        rows = runner(n_episodes=n_trials, disturbance=d)
+        all_results.extend(rows)
+
+    return all_results
 
 # ── Reporting ────────────────────────────────────────────────────────────────
 def print_summary(results: list[dict], label: str) -> None:
@@ -191,3 +298,12 @@ if __name__ == "__main__":
     # compare IDM against average DQN run
     dqn_flat = [r for run in dqn_all_runs for r in run]
     print_comparison(idm_results, dqn_flat)
+
+    # Grid sweep (4 speeds × 4 positions × 20 trials = 320 episodes per agent)
+    print("\nRunning IDM grid sweep...")
+    idm_grid = run_grid_sweep(agent="idm")
+    save_results(idm_grid, "idm_grid.csv")
+
+    print("\nRunning DQN grid sweep...")
+    dqn_grid = run_grid_sweep(agent="dqn")
+    save_results(dqn_grid, "dqn_grid.csv")
