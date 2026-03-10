@@ -7,9 +7,10 @@ from highway_env.vehicle.behavior import IDMVehicle
 from stable_baselines3 import DQN
 import numpy as np
 import pandas as pd
+from scipy.stats import truncnorm
 
 # ── Constants ────────────────────────────────────────────────────────────────
-V_TARGET = 15   # liveness threshold (m/s)
+V_TARGET = 17   # liveness threshold (m/s) — set at 17 to capture meaningful IDM braking degradation
 K        = 5    # consecutive steps below V_TARGET to count as speed failure
 
 RESULTS_DIR = "results"
@@ -215,6 +216,113 @@ def run_episodes_dqn(
 
     env.close()
     return results
+
+# ── Importance Sampling ───────────────────────────────────────────────────────
+# Nominal distribution p(d): Uniform over [SPEED_LO, SPEED_HI] x [POS_LO, POS_HI]
+# Proposal distribution q(d): product of truncated normals biased toward failure regions
+# IS weight: w(d) = p(d) / q(d)
+# Failure probability estimate: P(fail) ≈ (1/N) Σ w_i * f(d_i),  d_i ~ q
+
+SPEED_LO, SPEED_HI = 10.0, 25.0   # disturbance support: merging speed (m/s)
+POS_LO,   POS_HI   = 70.0, 130.0  # disturbance support: merging position (m)
+
+@dataclass
+class ISProposal:
+    speed_mean: float
+    speed_std:  float
+    pos_mean:   float
+    pos_std:    float
+
+# Proposals informed by grid sweep results:
+#   DQN fails at low position (70-90), any speed → bias proposal toward low position
+#   IDM fails at high position (130), low speed  → bias proposal toward high pos + low speed
+IS_PROPOSALS = {
+    "dqn": ISProposal(speed_mean=15.0, speed_std=5.0,  pos_mean=80.0,  pos_std=15.0),
+    "idm": ISProposal(speed_mean=12.0, speed_std=4.0,  pos_mean=125.0, pos_std=8.0),
+}
+
+def _trunc(mean: float, std: float, lo: float, hi: float) -> truncnorm:
+    a, b = (lo - mean) / std, (hi - mean) / std
+    return truncnorm(a, b, loc=mean, scale=std)
+
+def sample_proposal(proposal: ISProposal) -> tuple[Disturbance, float]:
+    """
+    Sample d ~ q(d) and return (disturbance, importance_weight).
+
+    Importance weight w = p(d) / q(d) where p is the uniform nominal distribution.
+    Multiply w by a failure indicator to get an unbiased failure probability estimate.
+    """
+    spd_rv = _trunc(proposal.speed_mean, proposal.speed_std, SPEED_LO, SPEED_HI)
+    pos_rv = _trunc(proposal.pos_mean,   proposal.pos_std,   POS_LO,   POS_HI)
+
+    spd = float(spd_rv.rvs())
+    pos = float(pos_rv.rvs())
+
+    p = 1.0 / ((SPEED_HI - SPEED_LO) * (POS_HI - POS_LO))  # uniform density
+    q = float(spd_rv.pdf(spd)) * float(pos_rv.pdf(pos))      # proposal density
+
+    return Disturbance(merging_speed=spd, merging_position=pos), p / q
+
+def sample_uniform() -> Disturbance:
+    """Sample disturbance uniformly from the nominal distribution p(d)."""
+    return Disturbance(
+        merging_speed=float(np.random.uniform(SPEED_LO, SPEED_HI)),
+        merging_position=float(np.random.uniform(POS_LO, POS_HI)),
+    )
+
+def is_failure_prob(results: list[dict], failure_key: str = "crashed") -> float:
+    """IS estimate of failure probability: (1/N) Σ w_i * f_i."""
+    return float(np.mean([r["is_weight"] * r[failure_key] for r in results]))
+
+def run_is_episodes(
+    agent: str = "dqn",
+    n_episodes: int = 200,
+    proposal: ISProposal | None = None,
+) -> list[dict]:
+    """
+    Run IS episodes: each disturbance is sampled from q, episode is rolled out,
+    result includes 'is_weight' = p(d)/q(d) for unbiased failure prob estimation.
+    """
+    if proposal is None:
+        proposal = IS_PROPOSALS[agent]
+    runner = run_episodes if agent == "idm" else run_episodes_dqn
+
+    all_results = []
+    for episode in range(n_episodes):
+        d, weight = sample_proposal(proposal)
+        row = runner(n_episodes=1, disturbance=d)[0]
+        row["episode"]   = episode
+        row["is_weight"] = weight
+        all_results.append(row)
+
+        if (episode + 1) % 50 == 0:
+            print(f"  ep {episode+1}/{n_episodes}  IS P(crash) = {is_failure_prob(all_results):.4f}", flush=True)
+
+    return all_results
+
+def run_mc_disturbance_episodes(
+    agent: str = "dqn",
+    n_episodes: int = 200,
+) -> list[dict]:
+    """
+    MC baseline with uniform disturbance sampling — apples-to-apples comparison
+    against IS. is_weight=1.0 for all episodes (p=q=uniform).
+    """
+    runner = run_episodes if agent == "idm" else run_episodes_dqn
+
+    all_results = []
+    for episode in range(n_episodes):
+        d = sample_uniform()
+        row = runner(n_episodes=1, disturbance=d)[0]
+        row["episode"]   = episode
+        row["is_weight"] = 1.0
+        all_results.append(row)
+
+        if (episode + 1) % 50 == 0:
+            crashes = sum(r["crashed"] for r in all_results)
+            print(f"  ep {episode+1}/{n_episodes}  MC crash rate = {crashes/(episode+1):.4f}", flush=True)
+
+    return all_results
 
 # ── Grid sweep ───────────────────────────────────────────────────────────────
 def run_grid_sweep(
