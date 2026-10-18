@@ -143,18 +143,21 @@ def plot_baseline_bars() -> None:
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     bars_idm = ax.bar(x - w/2, idm_vals,  w, label="IDM+MOBIL", color="steelblue")
-    ax.bar(x + w/2, dqn_means, w, label="DQN", color="darkorange",
-           yerr=dqn_stds, capsize=4)
+    bars_dqn = ax.bar(x + w/2, dqn_means, w, label="DQN", color="darkorange",
+                      yerr=dqn_stds, capsize=4)
 
-    # annotate zero IDM crash bar explicitly
-    ax.text(x[0] - w/2, 0.3, "0%", ha="center", va="bottom", fontsize=9, color="steelblue")
+    # annotate all bars with percent values
+    for xi, val in zip(x, idm_vals):
+        ax.text(xi - w/2, max(val, 0) + 0.5, f"{val:.1f}%", ha="center", va="bottom", fontsize=12, color="steelblue")
+    for xi, mean, std in zip(x, dqn_means, dqn_stds):
+        ax.text(xi + w/2, mean + std + 0.5, f"{mean:.1f}%", ha="center", va="bottom", fontsize=12, color="darkorange")
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=10)
     ax.set_ylabel("Rate (%)", fontsize=11)
     ax.set_title(f"Failure rates: IDM+MOBIL vs DQN (V_TARGET={V_TARGET} m/s)", fontsize=12)
     ax.legend(fontsize=10)
-    ax.set_ylim(bottom=0)
+    ax.set_ylim(bottom=0, top=max(idm_vals) * 1.2)
     ax.grid(axis="y", alpha=0.3)
 
     path = os.path.join(FIGURES_DIR, "baseline_bars.png")

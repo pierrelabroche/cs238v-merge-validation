@@ -13,3 +13,4 @@ dqn_merge.zip
 
 # Conda
 *.egg-info/
+.Rhistory
